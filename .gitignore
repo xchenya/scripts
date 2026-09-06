@@ -10,9 +10,9 @@ compose.yml
 compose.yaml
 
 # 运行数据
-/data/
-/logs/
-/output/
+data/
+logs/
+output/
 *.log
 *.bak
 
@@ -21,3 +21,8 @@ compose.yaml
 Thumbs.db
 *.swp
 
+
+# 覆盖安装的本机备份与临时文件
+.backups/
+.mtool-stage.*/
+.mtool-install.lock
