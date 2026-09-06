@@ -26,3 +26,6 @@ Thumbs.db
 .backups/
 .mtool-stage.*/
 .mtool-install.lock
+vertex-compose.yml
+.vertex-install.lock
+.vertex-compose.*
