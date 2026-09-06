@@ -6,11 +6,21 @@
 
 适用于 Linux VPS、本机 Docker Engine 和 Docker Compose 插件。需要 Bash、Python 3（仅标准库）、curl、ss 和 flock；请在交互式 SSH 终端中以 root 执行。脚本会检查依赖，不会自动安装 Docker。
 
+简短版（在 Bash 终端执行）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xchenya/scripts/main/vertex/vertex-install.sh)
+```
+
+完整版（下载成功并通过语法检查后执行）：
+
 ```bash
 (set -e; f=$(mktemp); trap 'rm -f "$f"' EXIT; curl -fsSL --fail-early --connect-timeout 10 --max-time 120 'https://raw.githubusercontent.com/xchenya/scripts/main/vertex/vertex-install.sh' -o "$f"; bash -n "$f"; bash "$f")
 ```
 
-命令先完整下载、检查 Bash 语法，再运行。`main` 会随仓库更新；需要固定版本时，把 URL 中的 `main` 换成审核过的完整提交 SHA。语法检查和同站点提供的 SHA256 校验不能代替代码审核。
+完整版先完整下载、检查 Bash 语法，再运行。`main` 会随仓库更新；需要固定版本时，把 URL 中的 `main` 换成审核过的完整提交 SHA。语法检查和同站点提供的 SHA256 校验不能代替代码审核。
+
+简短版通过 Bash 进程替换边下载边执行，省去了下载完成确认、预先语法检查、显式超时和临时文件清理；下载中途失败时，不能保证阻止已下载内容执行。两种命令都使用 HTTPS，并调用同一个安装脚本，安装选项和默认配置完全相同。完整版也不验证代码来源签名，语法检查不等于安全审计。
 
 ## 默认配置
 

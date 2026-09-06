@@ -6,13 +6,23 @@
 
 在已经安装 Docker Engine 与 Docker Compose 插件的 Linux VPS 上，以 root 在交互式 SSH 终端执行：
 
+简短版（在 Bash 终端执行）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xchenya/scripts/main/mtool/install.sh)
+```
+
+完整版（下载成功并通过语法检查后执行）：
+
 ```bash
 (set -e; f=$(mktemp); trap 'rm -f "$f"' EXIT; curl -fsSL --fail-early --connect-timeout 10 --max-time 120 'https://raw.githubusercontent.com/xchenya/scripts/main/mtool/install.sh' -o "$f"; bash -n "$f"; bash "$f")
 ```
 
-脚本下载完成且语法检查通过后，才开始交互安装。普通用户可先运行 `sudo -i` 进入 root 终端。
+完整版在脚本下载完成且语法检查通过后，才开始交互安装。普通用户可先运行 `sudo -i` 进入 root 终端。
 
 以上命令以仓库默认分支为 `main` 为前提。它读取该分支的当前版本；需要固定版本时，用审核过的完整提交 SHA 替换链接中的 `main`。
+
+简短版通过 Bash 进程替换边下载边执行，省去了下载完成确认、预先语法检查、显式超时和临时文件清理；下载中途失败时，不能保证阻止已下载内容执行。两种命令都使用 HTTPS，并调用同一个安装脚本，安装选项和默认配置完全相同。完整版也不验证代码来源签名，语法检查不等于安全审计。
 
 ## 环境要求
 
