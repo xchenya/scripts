@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Vertex 安装器：首次安装、已有容器配置复用及覆盖安装。
-# 数据默认挂载 /opt/vertex:/vertex，Web 默认 0.0.0.0:8443:3000。
+# 数据默认挂载 /opt/vertex:/vertex，Web 默认 0.0.0.0:3000:3000。
 set +x
 set -Eeuo pipefail
 umask 077
@@ -258,7 +258,7 @@ try:
                 print('访问地址：http://' + value + ':' + p['published'])
         print('数据位置：' + details['data'])
         print('首次安装初始密码位置：' + details['password_path'])
-        print('8443 等端口只是端口映射，默认使用 HTTP；公网访问还需安全组/防火墙放行，NAT VPS 需端口映射。')
+        print('默认使用 HTTP；公网访问还需安全组/防火墙放行，NAT VPS 需端口映射。')
     else:
         raise ValueError('未知配置操作。')
 except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
@@ -298,7 +298,7 @@ main() {
     VERTEX_STAGE=$(mktemp -d)
     local snapshot="$VERTEX_STAGE/existing.json" old_meta="$VERTEX_STAGE/existing-meta.json"
     local candidate="$VERTEX_STAGE/vertex-compose.yml" metadata="$VERTEX_STAGE/metadata.json"
-    local old_id='' old_project='' old_service='' reuse=false answer install_path web_port=8443 bind_address=0.0.0.0 timezone=Asia/Shanghai
+    local old_id='' old_project='' old_service='' reuse=false answer install_path web_port=3000 bind_address=0.0.0.0 timezone=Asia/Shanghai
     printf '\n[1/5] 检测已有 Vertex 容器\n' >&3
     if old_id=$(docker container inspect --format '{{.Id}}' vertex 2>/dev/null); then
         docker inspect "$old_id" > "$snapshot"
@@ -328,7 +328,7 @@ main() {
     if [[ "$reuse" == false ]]; then
         ask install_path 'Vertex 安装及数据目录（绝对路径）' '/opt/vertex'
         [[ "$install_path" == /* ]] || die '目录必须以 / 开头，不能使用 ~。'
-        ask web_port '宿主机 Web 端口（容器默认 3000）' '8443'
+        ask web_port '宿主机 Web 端口（容器默认 3000）' '3000'
         ask bind_address '监听地址（0.0.0.0 / 127.0.0.1）' '0.0.0.0'
         ask timezone '时区' 'Asia/Shanghai'
     fi
