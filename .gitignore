@@ -29,3 +29,6 @@ Thumbs.db
 vertex-compose.yml
 .vertex-install.lock
 .vertex-compose.*
+bitmanager-compose.yml
+.bitmanager-install.lock
+.bitmanager-compose.*
