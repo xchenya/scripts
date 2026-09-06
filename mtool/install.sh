@@ -2,7 +2,7 @@
 # MTool 安装 / 覆盖安装脚本：Linux + 本机 Docker Engine + Docker Compose 插件。
 # 以 root 执行。允许已有目录和容器；覆盖前备份配置，保留持久化数据目录。
 # 容器内部端口固定为 9808，镜像沿用用户提供的 3.0.1。
-# 默认仅本机访问、媒体只读、关闭特权。ISO 挂载可按需启用特权。
+# 默认监听所有 IPv4 网卡、媒体只读、关闭特权。ISO 挂载可按需启用特权。
 # 安装后使用：cd /opt/mtool && docker compose -f docker-compose.yml up -d
 # 密码写入权限为 600 的 Compose 文件；这是访问权限保护，不是加密。
 set +x
@@ -35,9 +35,68 @@ ask() {
     printf -v "$target" '%s' "${answer:-$fallback}"
 }
 
+valid_public_ipv4() {
+    local value=$1 octet first second
+    local -a octets=()
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$value"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+    first=$((10#${octets[0]}))
+    second=$((10#${octets[1]}))
+    # 查询结果不能是本机、私网、共享地址或组播等常见非公网地址。
+    (( first > 0 && first < 224 && first != 10 && first != 127 )) || return 1
+    (( first != 169 || second != 254 )) || return 1
+    (( first != 172 || second < 16 || second > 31 )) || return 1
+    (( first != 192 || second != 168 )) || return 1
+    (( first != 100 || second < 64 || second > 127 )) || return 1
+    return 0
+}
+
+get_public_ipv4() {
+    local endpoint candidate
+    # 只查询公网 IPv4，不使用环境代理；每个查询最多 3 秒，失败尝试备用服务。
+    for endpoint in 'https://api.ipify.org' 'https://checkip.amazonaws.com'; do
+        if candidate=$(curl -4 -fsS --noproxy '*' --connect-timeout 2 --max-time 3 --max-filesize 64 \
+            "$endpoint" 2>/dev/null); then
+            candidate=${candidate//$'\r'/}
+            if valid_public_ipv4 "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+show_result() {
+    local bind_address=$1 web_port=$2 login_name=$3 compose_file=$4 install_path=$5 backup_path=$6 public_ip
+    printf '\n========== MTool 已启动，Web 已响应 ==========\n'
+    printf '监听地址：%s:%s\n本机地址：http://127.0.0.1:%s\n' "$bind_address" "$web_port" "$web_port"
+    if [[ "$bind_address" == 0.0.0.0 ]]; then
+        if public_ip=$(get_public_ipv4); then
+            printf '公网地址：http://%s:%s\n' "$public_ip" "$web_port"
+        else
+            printf '公网地址：自动识别失败，请在 VPS 控制台查看公网 IPv4；安装不受影响。\n'
+        fi
+        printf '公网入口尚未从外部验证；请放行 TCP %s，NAT VPS 还需对应的端口映射。\n' "$web_port"
+    else
+        printf '当前仅本机监听，远程访问请使用 SSH 隧道或本机反向代理。\n'
+    fi
+    printf '登录账号：%s\n登录密码：使用本次设置或生成的密码\n配置文件：%s\n' "$login_name" "$compose_file"
+    if [[ -n "$backup_path" ]]; then
+        printf '旧配置备份：%s\n' "$backup_path"
+    fi
+    printf '\n查看日志：docker logs --tail 100 mtool\n重启服务：docker restart mtool\n'
+    printf '查看状态：cd %q && docker compose --env-file /dev/null -f docker-compose.yml ps\n' "$install_path"
+    printf '请在浏览器中验证登录和媒体处理。\n'
+}
+
 main() {
     [[ $(uname -s) == Linux ]] || die '本脚本适用于 Linux VPS。'
     (( EUID == 0 )) || die '请以 root 运行，例如 sudo bash mtool-install.sh。'
+    printf '\n[1/5] 检查运行环境\n'
     local dependency
     for dependency in docker curl openssl ss realpath flock; do
         command -v "$dependency" >/dev/null 2>&1 || die "缺少依赖：$dependency。请先安装。"
@@ -54,6 +113,7 @@ main() {
         fi
     fi
     { exec 3<>/dev/tty; } 2>/dev/null || die '需要交互终端；请在 SSH 终端中运行。'
+    printf '\n[2/5] 设置部署参数\n' >&3
 
     local install_path media_path web_port bind_address login_name login_password
     local iso_choice write_choice confirm existing_listeners port_owners='' owner owns_port=false
@@ -103,8 +163,8 @@ main() {
         printf '端口 %s 由当前 mtool 使用，重建时会继续使用该端口。\n' "$web_port" >&3
     fi
 
-    printf '\n127.0.0.1：通过 SSH 隧道或本机 HTTPS 反代访问。\n0.0.0.0：开放宿主机所有 IPv4 网卡，请配置云安全组和 HTTPS。\n' >&3
-    ask bind_address '监听地址（127.0.0.1 / 0.0.0.0）' '127.0.0.1'
+    printf '\n0.0.0.0：监听宿主机所有 IPv4 网卡，可使用公网 IP 访问；请配置云安全组和 HTTPS。\n127.0.0.1：仅本机监听，通过 SSH 隧道或本机反向代理访问。\n' >&3
+    ask bind_address '监听地址（0.0.0.0 / 127.0.0.1）' '0.0.0.0'
     [[ "$bind_address" == 127.0.0.1 || "$bind_address" == 0.0.0.0 ]] || die '请填写 127.0.0.1 或 0.0.0.0。'
     ask login_name '登录用户名' 'admin'
     printf '设置登录密码（隐藏输入，回车生成随机密码）：' >&3
@@ -190,6 +250,7 @@ EOF
     chmod 600 -- "$candidate_file"
     local -a candidate=(docker compose --project-name "$project_name" --env-file /dev/null -f "$candidate_file")
     local -a compose=(docker compose --project-name "$project_name" --env-file /dev/null -f "$compose_file")
+    printf '\n[3/5] 校验配置并拉取镜像\n'
     "${candidate[@]}" config --quiet
     # 下载失败不会覆盖旧配置，也不会停止旧容器。
     "${candidate[@]}" pull
@@ -197,6 +258,7 @@ EOF
     local current_id name
     current_id=$(docker container inspect --format '{{.Id}}' mtool 2>/dev/null || true)
     [[ "$current_id" == "$existing_id" ]] || die '安装期间 mtool 容器发生了变化，请重新运行以读取当前状态。'
+    printf '\n[4/5] 备份配置并重建容器\n'
     if [[ "$existing_directory" == true || -n "$existing_id" || -e "$compose_file" || -L "$compose_file" ]]; then
         mkdir -p -- "$install_path/.backups"
         chmod 700 -- "$install_path/.backups"
@@ -231,20 +293,15 @@ EOF
         printf '请检查 Docker 错误；需要恢复时使用备份配置和其中记录的原挂载路径。\n' >&2
         return 1
     fi
-    printf '\n等待 Web 服务响应……\n'
+    printf '\n[5/5] 等待 Web 服务响应\n'
     local attempt http_code running
     for ((attempt=0; attempt<40; attempt++)); do
         http_code=$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 \
             "http://127.0.0.1:$web_port/" || true)
         running=$(docker inspect --format '{{.State.Running}}' mtool 2>/dev/null || true)
         if [[ "$running" == true && ( "$http_code" =~ ^[23][0-9][0-9]$ || "$http_code" == 401 || "$http_code" == 403 ) ]]; then
-            printf '\n容器正在运行，Web 已响应（HTTP %s）。请在浏览器中验证登录和媒体处理。\n' "$http_code"
-            printf '本机地址：http://127.0.0.1:%s\n账号：%s\n配置：%s\n' "$web_port" "$login_name" "$compose_file"
-            if [[ "$bind_address" == 0.0.0.0 ]]; then
-                printf '远程地址：http://你的VPS公网IP:%s（公网连通性尚未验证）。\n' "$web_port"
-            else
-                printf '远程访问：在电脑建立 SSH 隧道，或配置本机 HTTPS 反向代理。\n'
-            fi
+            printf '\nHTTP 响应：%s\n' "$http_code"
+            show_result "$bind_address" "$web_port" "$login_name" "$compose_file" "$install_path" "$backup_path"
             return 0
         fi
         sleep 2

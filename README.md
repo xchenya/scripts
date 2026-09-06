@@ -2,7 +2,7 @@
 
 | 脚本 | 简短说明 | 详细文档 |
 | --- | --- | --- |
-| MTool | 安装或覆盖安装 MTool，备份旧配置并保留持久化数据目录。 | [mtool/README.md](mtool/README.md) |
+| MTool | 安装或覆盖安装，备份旧配置并保留数据；默认开放 IPv4 监听，自动显示公网地址。 | [mtool/README.md](mtool/README.md) |
 
 ## MTool 执行命令
 
