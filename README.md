@@ -3,7 +3,7 @@
 | 脚本 | 简短说明 | 详细文档 |
 | --- | --- | --- |
 | MTool | 安装或覆盖安装，备份旧配置并保留数据；默认端口 `9808`，开放 IPv4 监听并显示公网地址。 | [mtool/README.md](mtool/README.md) |
-| Vertex | 检测已有容器并询问是否沿用目录、端口等配置；默认端口 `3000`，使用定制镜像并显示公网地址。 | [vertex/README.md](vertex/README.md) |
+| Vertex | 支持沿用已有容器配置和可选备份直链导入；默认端口 `3000`，固定使用定制镜像。 | [vertex/README.md](vertex/README.md) |
 | BitManager Web | 默认端口 `8088`，关闭注册；自定义目录及管理员账号密码，支持备份后覆盖安装。 | [bitmanager/README.md](bitmanager/README.md) |
 
 ## MTool 执行命令

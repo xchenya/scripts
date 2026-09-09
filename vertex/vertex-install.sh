@@ -5,7 +5,12 @@ set +x
 set -Eeuo pipefail
 umask 077
 VERTEX_STAGE=''
-cleanup() { if [[ -n "$VERTEX_STAGE" ]]; then rm -rf -- "$VERTEX_STAGE"; fi; }
+cleanup() {
+    if [[ -n "$VERTEX_STAGE" ]]; then
+        if [[ -f "$VERTEX_STAGE/import-plan.json" ]]; then vertex_restore cleanup "$VERTEX_STAGE/import-plan.json" || true; fi
+        rm -rf -- "$VERTEX_STAGE"
+    fi
+}
 trap cleanup EXIT
 trap 'printf "安装未完成（第 %s 行）。请检查上方错误，持久化数据不会自动删除。\n" "$LINENO" >&2' ERR
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -204,6 +209,13 @@ try:
         service['logging'] = {'driver': 'local', 'options': {'max-size': '10m', 'max-file': '3'}}
         Path(output).write_text(json.dumps(quoted_values(config), ensure_ascii=False, indent=2) + '\n')
         details = {'project': project, 'install_path': directory, 'data': data_description, 'password_path': password_path, 'web_ports': web_ports, 'ports': ports, 'timezone': service['environment'].get('TZ', '')}
+        restore_error = ''
+        if reuse and (mount['Type'] != 'bind' or not mount.get('RW', True)):
+            restore_error = '直链导入需要可写的 /vertex 宿主机目录挂载；Docker 数据卷或只读挂载仍可不导入备份正常安装。'
+        if reuse and any(m.get('Destination', '').startswith('/vertex/data/') or m.get('Destination') == '/vertex/data' for m in old.get('Mounts', [])):
+            restore_error = '存在覆盖 /vertex/data 的额外挂载，不能直接导入，请先整理挂载结构。'
+        details.update(restore_path=os.path.join(directory, 'data'), restore_error=restore_error,
+                       restore_uid=service['environment'].get('PUID', ''), restore_gid=service['environment'].get('PGID', ''))
         Path(metadata).write_text(json.dumps(details, ensure_ascii=False))
         print('管理目录：' + directory)
         print('数据位置：' + data_description)
@@ -265,6 +277,176 @@ except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
     print('错误：' + str(error), file=sys.stderr)
     sys.exit(1)
 PY
+}
+
+# 备份只解压普通文件/目录，不执行备份中的脚本，不使用 extractall。
+vertex_restore() {
+    python3 - "$@" <<'PY'
+import json, os, re, shutil, stat, sys, tarfile, tempfile, zipfile
+from pathlib import Path
+from urllib.parse import urlsplit
+
+MAX_BYTES = 4 * 1024**3
+MAX_FILES = 100000
+
+class RestoreError(ValueError): pass
+
+def read_json(path): return json.loads(Path(path).read_text())
+def write_json(path, value): Path(path).write_text(json.dumps(value, ensure_ascii=False))
+def target_for(meta):
+    if meta.get('restore_error'): raise RestoreError(meta['restore_error'])
+    target = Path(meta['restore_path'])
+    if target.is_symlink() or os.path.ismount(target):
+        raise RestoreError('导入目标 data 不能是符号链接或独立挂载点，请先整理数据挂载。')
+    if target.exists() and not target.is_dir(): raise RestoreError('导入目标 data 已存在且不是目录。')
+    return target
+
+def safe_name(name):
+    if not name or name.startswith('/') or '\\' in name or re.match(r'^[A-Za-z]:', name) or any(ord(c)<32 for c in name):
+        raise RestoreError('备份包含不安全的文件路径。')
+    parts = [p for p in name.split('/') if p not in ('', '.')]
+    if '..' in parts: raise RestoreError('备份包含越界路径。')
+    return Path(*parts) if parts else None
+
+try:
+    mode = sys.argv[1]
+    if mode == 'url':
+        url = Path(sys.argv[2]).read_text()
+        parts = urlsplit(url)
+        if parts.scheme not in ('http', 'https') or not parts.hostname or any(ord(c)<=32 for c in url) or parts.fragment:
+            raise RestoreError('请输入有效的 HTTP/HTTPS 文件直链，不支持空白字符或 URL 片段。')
+        _ = parts.port
+        escaped = url.replace('\\', '\\\\').replace('"', '\\"')
+        Path(sys.argv[3]).write_text('url = "' + escaped + '"\n')
+        print('=https' if parts.scheme == 'https' else '=http,https')
+    elif mode == 'target':
+        target = target_for(read_json(sys.argv[2]))
+        print('备份将替换的数据目录：' + str(target))
+    elif mode == 'extract':
+        archive, output, password_file, result_file = map(Path, sys.argv[2:])
+        if output.exists(): shutil.rmtree(output)
+        output.mkdir(mode=0o700)
+        password = password_file.read_bytes() or None
+        total = 0; count = 0; seen = set()
+        def unpack(name, size, is_dir, permissions, opener):
+            global total, count
+            count += 1; total += size
+            if count > MAX_FILES or total > MAX_BYTES or size < 0: raise RestoreError('备份解压后超过 4 GiB 或 100000 个条目的限制。')
+            relative = safe_name(name)
+            if relative is None:
+                if not is_dir: raise RestoreError('备份文件路径无效。')
+                return
+            if relative in seen: raise RestoreError('备份包含重复路径，无法确定恢复内容。')
+            seen.add(relative)
+            destination = output / relative
+            if is_dir:
+                destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+                return
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with opener() as source, destination.open('xb') as sink:
+                copied = 0
+                while True:
+                    chunk = source.read(1024*1024)
+                    if not chunk: break
+                    copied += len(chunk)
+                    if copied > size: raise RestoreError('备份文件大小与声明不一致。')
+                    sink.write(chunk)
+                if copied != size: raise RestoreError('备份文件内容不完整。')
+            destination.chmod(0o600 | (permissions & 0o111))
+        if zipfile.is_zipfile(archive):
+            with zipfile.ZipFile(archive) as package:
+                for member in package.infolist():
+                    permissions = member.external_attr >> 16
+                    kind = stat.S_IFMT(permissions)
+                    if kind not in (0, stat.S_IFREG, stat.S_IFDIR): raise RestoreError('备份包含链接或特殊文件，不能导入。')
+                    unpack(member.filename, member.file_size, member.is_dir(), permissions, lambda m=member: package.open(m, pwd=password))
+        else:
+            with tarfile.open(archive, 'r:*') as package:
+                for member in package:
+                    if not (member.isfile() or member.isdir()): raise RestoreError('备份包含链接或特殊文件，不能导入。')
+                    unpack(member.name, member.size, member.isdir(), member.mode, lambda m=member: package.extractfile(m))
+        candidates = list(output.rglob('setting.json'))
+        if len(candidates) != 1 or not candidates[0].is_file():
+            raise RestoreError('备份必须包含唯一的 setting.json，不能缺失或混入多份 Vertex 备份。')
+        settings = json.loads(candidates[0].read_text(encoding='utf-8-sig'))
+        if not isinstance(settings, dict): raise RestoreError('setting.json 必须是有效的 JSON 对象。')
+        write_json(result_file, {'source':str(candidates[0].parent)})
+        print('备份检查通过：已定位 setting.json 及同目录数据。')
+    elif mode == 'prepare':
+        metadata, extracted, backup, plan_file = sys.argv[2:]
+        meta = read_json(metadata); target = target_for(meta); source = Path(read_json(extracted)['source'])
+        backup = Path(backup)
+        if target.exists() and target.stat().st_dev != backup.stat().st_dev:
+            raise RestoreError('data 与备份目录不在同一文件系统，不能进行目录替换。')
+        previous = target.stat() if target.exists() else None
+        owners = []
+        for key, fallback in [('restore_uid', previous.st_uid if previous else 0), ('restore_gid', previous.st_gid if previous else 0)]:
+            value = meta.get(key, '') or str(fallback)
+            if not re.fullmatch(r'[0-9]{1,10}', value) or int(value) >= 2**32-1: raise RestoreError('PUID/PGID 无效，无法设置恢复文件所有者。')
+            owners.append(int(value))
+        staging = Path(tempfile.mkdtemp(prefix='.vertex-import-', dir=target.parent))
+        try:
+            shutil.copytree(source, staging, dirs_exist_ok=True)
+            settings_path = staging/'setting.json'
+            settings = json.loads(settings_path.read_text(encoding='utf-8-sig'))
+            settings['port'] = meta['web_ports'][0]['target']
+            settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2)+'\n')
+            for current, folders, files in os.walk(staging):
+                os.chown(current, *owners); os.chmod(current, 0o700)
+                for name in files:
+                    p = Path(current)/name
+                    os.chown(p, *owners); p.chmod(0o600 | (p.stat().st_mode & 0o111))
+            write_json(plan_file, {'target':str(target), 'staging':str(staging), 'saved':str(backup/'data-before-import'),
+                                  'previous_inode':previous.st_ino if previous else None, 'applied':False})
+        except BaseException:
+            shutil.rmtree(staging)
+            raise
+    elif mode == 'apply':
+        plan_file = sys.argv[2]; plan = read_json(plan_file)
+        target = Path(plan['target']); staging = Path(plan['staging']); saved = Path(plan['saved'])
+        if target.is_symlink() or os.path.ismount(target): raise RestoreError('恢复目标在安装期间发生变化。')
+        inode = target.stat().st_ino if target.exists() else None
+        if inode != plan['previous_inode'] or saved.exists(): raise RestoreError('恢复目标或备份位置在安装期间发生变化。')
+        moved = False; installed = False
+        try:
+            if target.exists(): target.rename(saved); moved = True
+            staging.rename(target); installed = True
+            plan['applied'] = True; write_json(plan_file, plan)
+        except BaseException:
+            if installed: target.rename(staging)
+            if moved: saved.rename(target)
+            raise
+        print('备份已导入：' + str(target))
+        if moved: print('原 data 目录已保留：' + str(saved))
+    elif mode == 'original-restored':
+        plan = read_json(sys.argv[2]); target = Path(plan['target'])
+        inode = target.stat().st_ino if target.exists() else None
+        sys.exit(0 if not target.is_symlink() and inode == plan['previous_inode'] else 1)
+    elif mode == 'cleanup':
+        plan = read_json(sys.argv[2]); staging = Path(plan['staging'])
+        if staging.is_dir(): shutil.rmtree(staging)
+    else:
+        raise RestoreError('未知备份操作。')
+except RestoreError as error:
+    print('备份处理失败：' + str(error), file=sys.stderr); sys.exit(1)
+except RuntimeError as error:
+    if 'password' in str(error).lower() or 'encrypted' in str(error).lower():
+        print('ZIP 需要密码或密码错误。', file=sys.stderr); sys.exit(3)
+    print('备份解压失败。', file=sys.stderr); sys.exit(1)
+except (ValueError, OSError, EOFError, zipfile.BadZipFile, tarfile.TarError, NotImplementedError):
+    # 不回显异常中的 URL、文件内容或凭据。
+    print('备份处理失败：文件损坏、结构/路径不安全、格式不支持，或数据目录/磁盘条件不满足要求。', file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+read_secret() {
+    local target=$1 prompt=$2 secret_reply
+    printf '%s：' "$prompt" >&3
+    IFS= read -r -s secret_reply <&3 || die '输入已中断。'
+    printf '\n' >&3
+    [[ ! "$secret_reply" =~ [[:cntrl:]] ]] || die '输入不能包含控制字符。'
+    printf -v "$target" '%s' "$secret_reply"
 }
 
 get_public_ipv4() {
@@ -338,12 +520,41 @@ main() {
     project_name=$(vertex_config get "$metadata" project)
     compose_file="$install_path/vertex-compose.yml"
     vertex_config preflight "$snapshot" "$metadata"
-    ask answer '开始部署？回车继续，输入 n 取消' 'y'
+    local restore_url='' restore_password='' restore_enabled=false restore_protocol='' restore_status
+    local import_plan="$VERTEX_STAGE/import-plan.json"
+    read_secret restore_url '备份下载直链（可选，回车跳过，输入隐藏）'
+    if [[ -n "$restore_url" ]]; then
+        restore_enabled=true
+        vertex_restore target "$metadata" >&3
+        printf '%s' "$restore_url" > "$VERTEX_STAGE/backup-url"
+        restore_protocol=$(vertex_restore url "$VERTEX_STAGE/backup-url" "$VERTEX_STAGE/curl.conf")
+        unset restore_url
+        read_secret restore_password 'ZIP 解压密码（无密码或 tar 备份直接回车）'
+        printf '%s' "$restore_password" > "$VERTEX_STAGE/zip-password"
+        unset restore_password
+        printf '将导入备份中的 setting.json 同目录数据；原 data 会先保留，账号密码使用备份内容，容器端口保持本次配置。\n' >&3
+    fi
+    ask answer '开始部署？回车继续，输入 n 取消' 'y' 
     case "${answer,,}" in y|yes) ;; n|no) printf '已取消，旧容器未修改。\n'; return 0 ;; *) die '请输入 y 或 n。' ;; esac
     local -a preparation=(docker compose --project-name "$project_name" --env-file /dev/null -f "$candidate")
     local -a compose=(docker compose --project-name "$project_name" --env-file /dev/null -f "$compose_file")
     printf '\n[3/5] 校验配置并拉取镜像\n'
     "${preparation[@]}" config --quiet
+    if [[ "$restore_enabled" == true ]]; then
+        printf '下载并检查 Vertex 备份（直链不会写入部署配置）...\n'
+        if ! curl -q -fsSL --proto '=http,https' --proto-redir "$restore_protocol" --connect-timeout 10 --max-time 1200 \
+            --max-filesize 1073741824 --config "$VERTEX_STAGE/curl.conf" -o "$VERTEX_STAGE/backup.archive" 2>"$VERTEX_STAGE/download-error"; then
+            die '备份下载失败或超过 1 GiB，旧容器和数据未修改。请检查直链有效期和网络后重试。'
+        fi
+        while true; do
+            if vertex_restore extract "$VERTEX_STAGE/backup.archive" "$VERTEX_STAGE/extracted" "$VERTEX_STAGE/zip-password" "$VERTEX_STAGE/extracted.json"; then break; else restore_status=$?; fi
+            [[ "$restore_status" == 3 ]] || die '备份检查未通过，旧容器和数据未修改；不会自动改为全新安装。'
+            read_secret restore_password '请重新输入 ZIP 密码（留空终止安装）'
+            [[ -n "$restore_password" ]] || die '已终止备份导入，旧容器和数据未修改。'
+            printf '%s' "$restore_password" > "$VERTEX_STAGE/zip-password"
+            unset restore_password
+        done
+    fi
     "${preparation[@]}" pull
     mkdir -p -- "$install_path"
     exec 9> "$install_path/.vertex-install.lock"
@@ -351,7 +562,7 @@ main() {
     current_id=$(docker container inspect --format '{{.Id}}' vertex 2>/dev/null || true)
     [[ "$current_id" == "$old_id" ]] || die '安装期间 vertex 容器发生变化，请重新运行以读取当前配置。'
     printf '\n[4/5] 备份配置并重建容器\n'
-    if [[ -n "$old_id" || -e "$compose_file" || -e "$install_path/docker-compose.yml" ]]; then
+    if [[ "$restore_enabled" == true || -n "$old_id" || -e "$compose_file" || -e "$install_path/docker-compose.yml" ]]; then
         mkdir -p -- "$install_path/.backups"
         chmod 700 -- "$install_path/.backups"
         backup_path=$(mktemp -d "$install_path/.backups/vertex-$(date +%Y%m%d-%H%M%S)-XXXXXX")
@@ -360,6 +571,20 @@ main() {
         done
         if [[ -n "$old_id" ]]; then cp -- "$snapshot" "$backup_path/container-inspect.json"; fi
         printf '旧配置备份：%s\n' "$backup_path"
+    fi
+    if [[ "$restore_enabled" == true ]]; then
+        vertex_restore prepare "$metadata" "$VERTEX_STAGE/extracted.json" "$backup_path" "$import_plan"
+        local was_running=false
+        if [[ -n "$old_id" ]]; then
+            was_running=$(docker inspect --format '{{.State.Running}}' "$old_id")
+            docker stop "$old_id" >/dev/null
+        fi
+        if ! vertex_restore apply "$import_plan"; then
+            if [[ "$was_running" == true ]] && vertex_restore original-restored "$import_plan"; then
+                docker start "$old_id" >/dev/null || true
+            fi
+            die "备份目录替换失败，请检查原数据及备份：$backup_path"
+        fi
     fi
     local pending
     pending=$(mktemp "$install_path/.vertex-compose.XXXXXX")
@@ -390,7 +615,12 @@ main() {
                 if [[ -n "$backup_path" ]]; then printf '旧配置备份：%s\n' "$backup_path"; fi
                 printf '\n查看日志：docker logs --tail 100 vertex\n重启服务：docker restart vertex\n'
                 printf '查看状态：cd %q && docker compose --env-file /dev/null -f vertex-compose.yml ps\n' "$install_path"
-                printf '首次安装可查看初始密码：docker exec vertex cat /vertex/data/password\n请在浏览器验证登录及任务运行。\n'
+                if [[ "$restore_enabled" == true ]]; then
+                    printf '已导入备份，请使用备份中的账号密码登录；下载器地址和任务配置请在网页中核对。\n'
+                else
+                    printf '首次安装可查看初始密码：docker exec vertex cat /vertex/data/password\n'
+                fi
+                printf '请在浏览器验证登录及任务运行。\n' 
                 return 0
             fi
         done <<< "$urls"

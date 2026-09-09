@@ -32,3 +32,6 @@ vertex-compose.yml
 bitmanager-compose.yml
 .bitmanager-install.lock
 .bitmanager-compose.*
+
+# Vertex 备份导入暂存数据
+.vertex-import-*/
